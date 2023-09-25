@@ -11,6 +11,10 @@
 #include "GPU_ParallelBitmap.h"
 #include "../general/Records.h"
 
+typedef struct {
+        unsigned char data[16];
+      } uchar16;
+
 class GPUParallelBitmapConstructor {
 private:
     static GPUParallelBitmap* mGPUParallelBitmap;

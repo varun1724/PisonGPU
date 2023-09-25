@@ -1,7 +1,10 @@
 #include <chrono>
 #include "../general/RecordLoader.h"
+#include "../general/Bitmap.h"
 #include "../general/BitmapIterator.h"
-#include "../general/BitmapConstructor.h"
+#include "../gpuSpec/GPU_ParallelBitmapConstructor.h"
+#include "../gpuSpec/GPU_ParallelBitmapIterator.h"
+#include "../general/Records.h"
 using namespace std::chrono;
 
 // $[*].user.id
@@ -51,8 +54,8 @@ int main() {
     /* process the input record: first build bitmap, then perform
      * the query with a bitmap iterator
      */
-    Bitmap* bm = BitmapConstructor::construct(rec, thread_num, level_num);
-    BitmapIterator* iter = BitmapConstructor::getIterator(bm);
+    Bitmap* bm =  GPUParallelBitmapConstructor::construct(rec, thread_num, level_num);
+    BitmapIterator* iter = new GPUParallelBitmapIterator((GPUParallelBitmap*)bm);
     std::string output = query(iter);
 
     // End clock
@@ -65,7 +68,6 @@ int main() {
 
     delete iter;
     delete bm;
-
 
     return 0;
 }

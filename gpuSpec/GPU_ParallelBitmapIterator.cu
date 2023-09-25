@@ -63,6 +63,7 @@ __global__ void generateCommaPositionsInKernel(ParallelBitmapMetadata* pb_metada
 
             long offset = i * 64 + zeroCount;
             if (start_pos <= offset && offset <= end_pos) {
+                // This seems off
                 comma_pos_info[threadIdx.x].comma_positions[++comma_pos_info[threadIdx.x].top_comma_positions] = offset;
             }
             commabit = commabit & (commabit - 1);
@@ -92,20 +93,24 @@ void GPUParallelBitmapIterator::generateCommaPositionsParallel(long start_pos, l
         return;
     }
 
-    CommaPosInfo* cuda_comma_pos_info;
-    ParallelBitmapMetadata* cuda_pb_metadata;
+    CommaPosInfo* dev_comma_pos_info;
+    ParallelBitmapMetadata* dev_pb_metadata;
 
-    cudaMalloc(&cuda_comma_pos_info, sizeof(comma_pos_info));
-    cudaMalloc(&cuda_pb_metadata, sizeof(pb_metadata));
+    cudaMalloc(&dev_comma_pos_info, sizeof(comma_pos_info));
+    cudaMalloc(&dev_pb_metadata, sizeof(pb_metadata));
 
-    cudaMemcpy(cuda_comma_pos_info, comma_pos_info, sizeof(comma_pos_info), cudaMemcpyHostToDevice);
-    cudaMemcpy(cuda_pb_metadata, pb_metadata, sizeof(pb_metadata), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_comma_pos_info, comma_pos_info, sizeof(comma_pos_info), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_pb_metadata, pb_metadata, sizeof(pb_metadata), cudaMemcpyHostToDevice);
 
-    generateCommaPositionsInKernel<<<1, end_chunk>>>(cuda_pb_metadata, cuda_comma_pos_info, start_pos, end_pos, level, num_of_threads);
+    generateCommaPositionsInKernel<<<1, end_chunk>>>(dev_pb_metadata, dev_comma_pos_info, start_pos, end_pos, level, num_of_threads);
 
-    cudaMemcpy(cuda_comma_pos_info, comma_pos_info, sizeof(comma_pos_info), cudaMemcpyDeviceToHost);
-    cudaFree(cuda_comma_pos_info);
+    cudaMemcpy(dev_comma_pos_info, comma_pos_info, sizeof(comma_pos_info), cudaMemcpyDeviceToHost);
 
+    cudaFree(dev_comma_pos_info);
+    cudaFree(dev_pb_metadata);
+
+
+    // Issue is here, I think error coming from acessing .top_comma_positions
     for (int i = start_chunk; i <= end_chunk; ++i) {
         for (int j = 0; j <= comma_pos_info[i].top_comma_positions; ++j) {
             comma_positions[++top_comma_positions] = comma_pos_info[i].comma_positions[j];
@@ -121,12 +126,12 @@ void GPUParallelBitmapIterator::gatherParallelBitmapInfo() {
     int chunk_num = mGPUParallelBitmap->mThreadNum;
     int depth = mGPUParallelBitmap->mDepth;
     for (int chunk_id = 0; chunk_id < chunk_num; ++chunk_id) {
-        pb_metadata[chunk_id].start_word_id = mGPUParallelBitmap->mBitmaps[chunk_id]->mStartWordId;
-        pb_metadata[chunk_id].end_word_id = mGPUParallelBitmap->mBitmaps[chunk_id]->mEndWordId;
-        pb_metadata[chunk_id].quote_bitmap = mGPUParallelBitmap->mBitmaps[chunk_id]->mQuoteBitmap;
+        pb_metadata[chunk_id].start_word_id = mGPUParallelBitmap->mStartWordIds[chunk_id];
+        pb_metadata[chunk_id].end_word_id = mGPUParallelBitmap->mEndWordIds[chunk_id];
+        pb_metadata[chunk_id].quote_bitmap = mGPUParallelBitmap->quoteBitmaps[chunk_id];
         for (int l = 0; l <= depth; ++l) {
-            pb_metadata[chunk_id].lev_colon_bitmap[l] = mGPUParallelBitmap->mBitmaps[chunk_id]->mFinalLevColonBitmap[l];
-            pb_metadata[chunk_id].lev_comma_bitmap[l] = mGPUParallelBitmap->mBitmaps[chunk_id]->mFinalLevCommaBitmap[l];
+            pb_metadata[chunk_id].lev_colon_bitmap[l] = mGPUParallelBitmap->finalColonBitmaps[chunk_id][l];
+            pb_metadata[chunk_id].lev_comma_bitmap[l] = mGPUParallelBitmap->finalCommaBitmaps[chunk_id][l];
         }
     }
 }

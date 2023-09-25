@@ -1,22 +1,21 @@
 #include "GPU_ParallelBitmapConstructor.h"
-#include "GPU_LocalBitmap.h"
 
 
 //////////////////////
 //////////////////////
-// LOCAL BITMAP FUCNTIONS
+// LOCAL BITMAP FUNCTIONS
 //////////////////////
 //////////////////////
 
 // Function to store the uchar16 vector into the memory pointed by uint16_t* pointer
-__device__ void GPULocalBitmap::store(uchar16 vector, uint16_t* v_data) {
+__device__ void store(uchar16 vector, uint16_t* v_data) {
     unsigned char* uchar_ptr = (unsigned char*)v_data;
     for (int i = 0; i < 16; i++) {
         uchar_ptr[i] = vector.data[i];
     }
 }
 
-__device__ unsigned int GPULocalBitmap::uchar16_movemask(const uchar16& vector) {
+__device__ unsigned int uchar16_movemask(const uchar16& vector) {
     // Convert uchar16 to uint16_t (16-bit unsigned integers)
     uint16_t v_data[16];
     store(vector, v_data);
@@ -32,7 +31,7 @@ __device__ unsigned int GPULocalBitmap::uchar16_movemask(const uchar16& vector) 
 }
 
 // Perform carry-less multiplication
-__device__ unsigned long GPULocalBitmap::clmul64(unsigned long num1, unsigned long num2) {
+__device__ unsigned long clmul64(unsigned long num1, unsigned long num2) {
     unsigned long result = 0;
 
     for (int i = 0; i < 64; i++) {
@@ -46,7 +45,7 @@ __device__ unsigned long GPULocalBitmap::clmul64(unsigned long num1, unsigned lo
 
 
 // Function to set all values in the uchar16 type to the specified value
-__device__ uchar16 GPULocalBitmap::make_uchar16(unsigned char value) {
+__device__ uchar16 make_uchar16(unsigned char value) {
     uchar16 result;
     for (int i = 0; i < 16; i++) {
         result.data[i] = value;
@@ -55,7 +54,7 @@ __device__ uchar16 GPULocalBitmap::make_uchar16(unsigned char value) {
 }
 
 // Function to perform a bitwise and between two uchar16 types
-__device__ uchar16 GPULocalBitmap::bitwiseAnd(const uchar16& v1, const uchar16& v2) {
+__device__ uchar16 bitwiseAnd(const uchar16& v1, const uchar16& v2) {
     uchar16 result;
     for (int i = 0; i < 16; i++) {
         result.data[i] = v1.data[i] & v2.data[i];
@@ -64,17 +63,45 @@ __device__ uchar16 GPULocalBitmap::bitwiseAnd(const uchar16& v1, const uchar16& 
 }
 
 // Checks for overflow
-__device__ bool GPULocalBitmap::addWithOverflowCheck(unsigned long a, unsigned long b, unsigned long* result) {
+__device__ bool addWithOverflowCheck(unsigned long a, unsigned long b, unsigned long* result) {
     unsigned long long sum = a + b;
     bool overflow = (sum < a) || (sum < b); // Check if the sum is less than any of the operands
     *result = sum;
     return overflow;
 }
 
-__device__ void nonSpecIndexConstruction() {
+// Creates the final leveled bitmaps on different threads
+// TODO: Edit function to account for flattened inputs
+__global__ void nonSpecIndexConstructionKernel(
+    int* chunkEndLocs, char* record, int mDepth, unsigned long* finalColonBitmaps, 
+    unsigned long* finalCommaBitmaps, unsigned long* quoteBitmaps,  
+    unsigned long* mStartInStrBitmaps, int* endLevels) {
+        
 
     // Based on the array that is passed in, the chunk that the record needs to eval is determined
+    int recordLength = 0;
+    if (threadIdx.x == 0) {
+        recordLength = chunkEndLocs[0];
+    } else {
+        record += chunkEndLocs[threadIdx.x-1];
+        recordLength = chunkEndLocs[threadIdx.x] - chunkEndLocs[threadIdx.x-1];
+    }
 
+    // Assign number of temp words variables
+    long mNumTmpWords = recordLength / 32;
+    long mNumWords = recordLength / 64;
+
+    // Variables for tracking maximum positive and minimum negative levels in threads
+    int mMaxPositiveLevel = 0;
+    int mMinNegativeLevel = -1;
+
+    // Create variables to store temp leveled bitmaps
+    // each thread starts with level 0, following two arrays save bitmaps for levels higher than 0 (temporary result)
+    unsigned long *mLevColonBitmap[MAX_LEVEL];
+    unsigned long *mLevCommaBitmap[MAX_LEVEL];
+    // each thread starts with level 0, following two arrays save bitmaps for levels less than 0 (temporary result)
+    unsigned long *mNegLevColonBitmap[MAX_LEVEL];
+    unsigned long *mNegLevCommaBitmap[MAX_LEVEL];
 
 
     // vectors for structural characters
@@ -115,7 +142,7 @@ __device__ void nonSpecIndexConstruction() {
     // variables for saving context information among different words
     int top_word = -1;
     uint64_t prev_iter_ends_odd_backslash = 0ULL;
-    uint64_t prev_iter_inside_quote = mStartInStrBitmap;
+    uint64_t prev_iter_inside_quote = mStartInStrBitmaps[threadIdx.x];
     const uint64_t even_bits = 0x5555555555555555ULL;
     const uint64_t odd_bits = ~even_bits;
 
@@ -128,8 +155,8 @@ __device__ void nonSpecIndexConstruction() {
         uchar16 v_text1 = make_uchar16(0);
 
         for (int j = 0; j < sizeof(uchar16); j++) {
-            v_text0.data[j] = mRecord[i + j];
-            v_text0.data[j] = mRecord[i + 16 + j];
+            v_text0.data[j] = record[i + j];
+            v_text0.data[j] = record[i + 16 + j];
         }
 
         colonbit0 = uchar16_movemask(bitwiseAnd(v_text0, v_colon0));
@@ -165,7 +192,7 @@ __device__ void nonSpecIndexConstruction() {
         rbracketbit = static_cast<unsigned long>((static_cast<uint32_t>(rbracketbit0) << 16) | static_cast<uint32_t>(rbracketbit1));
 
         // first half of the word (lowest 32 bits)
-        if(j % 2 == 0) {
+        if (j % 2 == 0) {
             colonbitT = colonbit;
             quotebitT = quotebit;
             escapebitT = escapebit;
@@ -203,7 +230,14 @@ __device__ void nonSpecIndexConstruction() {
             uint64_t odd_start_even_end = odd_carry_ends & even_bits;
             uint64_t odd_ends = even_start_odd_end | odd_start_even_end;
             int64_t quote_bits = quotebit & ~odd_ends;
-            mQuoteBitmap[++top_word] = quote_bits;
+
+
+            top_word += 1;
+            int startPos = 0;
+            if (threadIdx.x != 0) {
+                startPos = chunkEndLocs[threadIdx.x-1] / 64;
+            }
+            quoteBitmaps[startPos + top_word] = static_cast<unsigned long>(quote_bits);
 
             unsigned long long allOnes64Bit = ULLONG_MAX;
             str_mask = clmul64(quote_bits, allOnes64Bit);
@@ -237,8 +271,8 @@ __device__ void nonSpecIndexConstruction() {
                         mLevColonBitmap[cur_level][top_word] = colonbit;
                     } else {
                         mLevCommaBitmap[cur_level][top_word] = commabit;
-	            }
-	        } else if (cur_level < 0) {
+            }
+        } else if (cur_level < 0) {
                     if (!mNegLevColonBitmap[-cur_level]) {
                         mNegLevColonBitmap[-cur_level] = (unsigned long*)malloc(mNumWords * sizeof(unsigned long));
                         // before finding the first bracket, update minimum negative level
@@ -286,7 +320,7 @@ __device__ void nonSpecIndexConstruction() {
                             }
                             else if (cb_bit == lb_bit && cur_level + 1 <= mDepth) {
                                 if (!mLevCommaBitmap[cur_level + 1]) {
-                                     mLevCommaBitmap[cur_level + 1] = (unsigned long*)malloc(mNumWords * sizeof(unsigned long));
+                                    mLevCommaBitmap[cur_level + 1] = (unsigned long*)malloc(mNumWords * sizeof(unsigned long));
                                 }
                                 mLevCommaBitmap[cur_level + 1][top_word] |= cb_bit;
                             }
@@ -314,7 +348,7 @@ __device__ void nonSpecIndexConstruction() {
                             else if (cb_bit == lb_bit) {
                                 if (cur_level + 1 == 0) {
                                     if (!mLevCommaBitmap[0]) {
-                                         mLevCommaBitmap[0] = (unsigned long*)malloc(mNumWords * sizeof(unsigned long));
+                                        mLevCommaBitmap[0] = (unsigned long*)malloc(mNumWords * sizeof(unsigned long));
                                     }
                                     mLevCommaBitmap[0][top_word] |= cb_bit;
                                 } else {
@@ -331,10 +365,10 @@ __device__ void nonSpecIndexConstruction() {
                             lb_mask = lb_mask & (lb_mask - 1);
                             lb_bit = lb_mask & (-lb_mask);
                             ++cur_level;
-                            if (mThreadId == 0 && cur_level == 0) {
+                            if (threadIdx.x == 0 && cur_level == 0) {
                                 // JSON record at the top level could be an array
                                 if (!mLevCommaBitmap[cur_level]) {
-                                     mLevCommaBitmap[cur_level] = (unsigned long*)malloc(mNumWords * sizeof(unsigned long));
+                                    mLevCommaBitmap[cur_level] = (unsigned long*)malloc(mNumWords * sizeof(unsigned long));
                                 }
                                 mLevCommaBitmap[cur_level][top_word] |= cb_bit;
                             }
@@ -354,50 +388,133 @@ __device__ void nonSpecIndexConstruction() {
                         first = 0;
                     }
                 }
-	        }
+        }
         }
     }
     if (mDepth == MAX_LEVEL - 1) mDepth = mMaxPositiveLevel;
-    mEndLevel = cur_level;
+    endLevels[threadIdx.x] = cur_level;
+    
+    __syncthreads();
+
+    // TODO: Merge correctly
+    // Merge bitmaps for each chunk into final bitmaps
+    int curLevel = endLevels[0];
+
+    // if (threadIdx.x != 0) {
+    //     for (int i = 0; i <= mMaxPositiveLevel; ++i) {
+    //         *finalColonBitmaps[threadIdx.x][i] = mLevColonBitmap[i];
+    //         *finalCommaBitmaps[threadIdx.x][i] = mLevCommaBitmap[i];
+    //     }
+    // } else {
+    //     // Set cur_level to the correct value
+    //     for (int i = 1; i < threadIdx.x; ++i) {
+    //         curLevel += (endLevels[i] + 1);
+    //     }
+
+    //     for(int j = 1; j <= -mMinNegativeLevel && (curLevel - j + 1) >= 0; ++j) {
+    //         *finalColonBitmaps[threadIdx.x][curLevel - j + 1] = mNegLevColonBitmap[j];
+    //         *finalCommaBitmaps[threadIdx.x][curLevel - j + 1] = mNegLevCommaBitmap[j];
+    //     }
+    //     for(int j = 0; j <= mMaxPositiveLevel && (curLevel + j + 1) >= 0; ++j) {
+    //         *finalColonBitmaps[threadIdx.x][curLevel + j + 1] = mLevColonBitmap[j];
+    //         *finalCommaBitmaps[threadIdx.x][curLevel + j + 1] = mLevCommaBitmap[j];
+    //     }
+    // }
+
+    if (threadIdx.x != 0) {
+        for (int i = 0; i <= mMaxPositiveLevel; ++i) {
+            finalColonBitmaps[threadIdx.x * (mMaxPositiveLevel + 1) + i] = *mLevColonBitmap[i];
+            finalCommaBitmaps[threadIdx.x * (mMaxPositiveLevel + 1) + i] = *mLevCommaBitmap[i];
+        }
+    } else {
+        // Set cur_level to the correct value
+        for (int i = 1; i < threadIdx.x; ++i) {
+            curLevel += (endLevels[i] + 1);
+        }
+
+        for (int j = 1; j <= -mMinNegativeLevel && (curLevel - j + 1) >= 0; ++j) {
+            finalColonBitmaps[threadIdx.x * (mMaxPositiveLevel + 1) + curLevel - j + 1] = *mNegLevColonBitmap[j];
+            finalCommaBitmaps[threadIdx.x * (mMaxPositiveLevel + 1) + curLevel - j + 1] = *mNegLevCommaBitmap[j];
+        }
+        for (int j = 0; j <= mMaxPositiveLevel && (curLevel + j + 1) >= 0; ++j) {
+            finalColonBitmaps[threadIdx.x * (mMaxPositiveLevel + 1) + curLevel + j + 1] = *mLevColonBitmap[j];
+            finalCommaBitmaps[threadIdx.x * (mMaxPositiveLevel + 1) + curLevel + j + 1] = *mLevCommaBitmap[j];
+        }
+    }
+    
+    // Free all temp bitmaps that were created
+    for(int m = 0; m < MAX_LEVEL; ++m){
+        if (mLevColonBitmap[m]) {
+            free(mLevColonBitmap[m]);
+            mLevColonBitmap[m] = NULL;
+        }
+        if (mLevCommaBitmap[m]) {
+            free(mLevCommaBitmap[m]);
+            mLevCommaBitmap[m] = NULL;
+        }
+        if (mNegLevColonBitmap[m]) {
+            free(mNegLevColonBitmap[m]);
+            mNegLevColonBitmap[m] = NULL;
+        }
+        if (mNegLevCommaBitmap[m]) {
+            free(mNegLevCommaBitmap[m]);
+            mNegLevCommaBitmap[m] = NULL;
+        }
+    }
+
     return;
+
 }
 
 
 
 ///////////////////////////////////
 ///////////////////////////////////
-/// BUILD STRING MASK BITMAP FUNCTION
+/// BUILD LEVELED BITMAPS FUNCTION
 /// For speculative mode
 ///////////////////////////////////
 ///////////////////////////////////
 
+__global__ void specIndexConstructionKernel(
+    int* chunkEndLocs, char* record, int mDepth, unsigned long**** finalColonBitmaps, 
+    unsigned long**** finalCommaBitmaps, unsigned long*** quoteBitmaps,  
+    unsigned long* mStartInStrBitmaps, unsigned long* mEndInStrBitmaps, int* endLevels) {
 
-__device__ void GPULocalBitmap::buildStringMaskBitmap() {
+    // Based on the array that is passed in, the chunk that the record needs to eval is determined
+    int recordLength = 0;
+    if (threadIdx.x == 0) {
+        recordLength = chunkEndLocs[0];
+    } else {
+        record += chunkEndLocs[threadIdx.x-1];
+        recordLength = chunkEndLocs[threadIdx.x] - chunkEndLocs[threadIdx.x-1];
+    }
+
+    // Assign number of temp words variables
+    long mNumTmpWords = recordLength / 32;
+    long mNumWords = recordLength / 64;
+
+    // Variables for tracking maximum positive and minimum negative levels in threads
+    int mMaxPositiveLevel = 0;
+    int mMinNegativeLevel = -1;
+
+    // Create variables to store temp leveled bitmaps
+    // each thread starts with level 0, following two arrays save bitmaps for levels higher than 0 (temporary result)
+    unsigned long *mLevColonBitmap[MAX_LEVEL];
+    unsigned long *mLevCommaBitmap[MAX_LEVEL];
+    // each thread starts with level 0, following two arrays save bitmaps for levels less than 0 (temporary result)
+    unsigned long *mNegLevColonBitmap[MAX_LEVEL];
+    unsigned long *mNegLevCommaBitmap[MAX_LEVEL];
+    
+
     // allocate memory space for saving results
-    if (!mQuoteBitmap) {
-        mQuoteBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
-    }
-    if (!mColonBitmap) {
-        mColonBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
-    }
-    if (!mCommaBitmap) {
-        mCommaBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
-    }
-    if (!mStrBitmap) {
-        mStrBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
-    }
-    if (!mLbraceBitmap) {
-        mLbraceBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
-    }
-    if (!mRbraceBitmap) {
-        mRbraceBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
-    }
-    if (!mLbracketBitmap) {
-        mLbracketBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
-    }
-    if (!mRbracketBitmap) {
-        mRbracketBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
-    }
+    unsigned long* mColonBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
+    unsigned long* mCommaBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
+    unsigned long* mStrBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
+    unsigned long* mLbraceBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
+    unsigned long* mRbraceBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
+    unsigned long* mLbracketBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
+    unsigned long* mRbracketBitmap = (unsigned long*)malloc((mNumWords) * sizeof(unsigned long));
+    
 
     // vectors for structural characters
     // Creates a 128 bit vector type containing 4 32 bit unsigned integers
@@ -432,7 +549,7 @@ __device__ void GPULocalBitmap::buildStringMaskBitmap() {
     // variables for saving context information among different words
     int top_word = -1;
     uint64_t prev_iter_ends_odd_backslash = 0ULL;
-    uint64_t prev_iter_inside_quote = mStartInStrBitmap;
+    uint64_t prev_iter_inside_quote = mStartInStrBitmaps[threadIdx.x];
     const uint64_t even_bits = 0x5555555555555555ULL;
     const uint64_t odd_bits = ~even_bits;
 
@@ -440,10 +557,13 @@ __device__ void GPULocalBitmap::buildStringMaskBitmap() {
         colonbit = 0, quotebit = 0, escapebit = 0, lbracebit = 0, rbracebit = 0, commabit = 0, lbracketbit = 0, rbracketbit = 0;
         unsigned long i = j * 32;
         // step 1: build structural character bitmaps
-        uchar16 v_text0;
-        uchar16 v_text1;
-        memcpy(&v_text0, mRecord + i, sizeof(uchar16));
-        memcpy(&v_text1, mRecord + i + 16, sizeof(uchar16));
+        uchar16 v_text0 = make_uchar16(0);
+        uchar16 v_text1 = make_uchar16(0);
+
+        for (int j = 0; j < sizeof(uchar16); j++) {
+            v_text0.data[j] = record[i + j];
+            v_text0.data[j] = record[i + 16 + j];
+        }
 
         colonbit0 = uchar16_movemask(bitwiseAnd(v_text0, v_colon0));
         colonbit1 = uchar16_movemask(bitwiseAnd(v_text1, v_colon1));
@@ -477,7 +597,7 @@ __device__ void GPULocalBitmap::buildStringMaskBitmap() {
         rbracketbit1 = uchar16_movemask(bitwiseAnd(v_text1, v_rbracket1));
         rbracketbit = static_cast<unsigned long>((static_cast<uint32_t>(rbracketbit0) << 16) | static_cast<uint32_t>(rbracketbit1));
         // first half of the word (lowest 32 bits)
-        if(j % 2 == 0) {
+        if (j % 2 == 0) {
             colonbitT = colonbit;
             quotebitT = quotebit;
             escapebitT = escapebit;
@@ -521,7 +641,7 @@ __device__ void GPULocalBitmap::buildStringMaskBitmap() {
             uint64_t odd_start_even_end = odd_carry_ends & even_bits;
             uint64_t odd_ends = even_start_odd_end | odd_start_even_end;
             int64_t quote_bits = quotebit & ~odd_ends;
-            mQuoteBitmap[top_word] = quote_bits;
+            *quoteBitmaps[threadIdx.x][top_word] = static_cast<unsigned long>(quote_bits);
 
             // step 3: build string mask bitmaps
             unsigned long long allOnes64Bit = ULLONG_MAX;
@@ -531,24 +651,33 @@ __device__ void GPULocalBitmap::buildStringMaskBitmap() {
             prev_iter_inside_quote = static_cast<uint64_t>(static_cast<int64_t>(str_mask) >> 63);
         }
     }
-    mEndInStrBitmap = prev_iter_inside_quote;
-}
+    mEndInStrBitmaps[threadIdx.x] = prev_iter_inside_quote;
 
+    // Sync threads to be able to access into all arrays
+    __syncthreads();
 
-///////////////////////////////////
-///////////////////////////////////
-/// BUILD LEVELED BITMAP FUNCTION
-/// For speculative mode
-///////////////////////////////////
-///////////////////////////////////
+    // Rectifty bitmaps logic
+    prev_iter_inside_quote = mEndInStrBitmaps[0];
+    if (threadIdx.x > 1) {
+        prev_iter_inside_quote = mEndInStrBitmaps[threadIdx.x-1];
+    }
+    if (prev_iter_inside_quote != mStartInStrBitmaps[threadIdx.x] && threadIdx.x > 0) {
+        mStartInStrBitmaps[threadIdx.x] = prev_iter_inside_quote;
+        // flip string mask bitmaps
+        //cout<<"flip for "<<i<<"th thread "<<endl;
+        for (int j = 0; j < mNumWords; ++j) {
+            mStrBitmap[j] = ~mStrBitmap[j];
+        }
+        if (mEndInStrBitmaps[threadIdx.x] == 0) {
+            mEndInStrBitmaps[threadIdx.x] = 0xffffffffffffffffULL;
+        } else {
+            mEndInStrBitmaps[threadIdx.x] = 0ULL;
+        }
+    }
 
+    __syncthreads();
 
-__device__ void GPULocalBitmap::buildLeveledBitmap() {
-    // variables for saving temporary results in the first four steps
-    unsigned long colonbit, lbracebit, rbracebit, commabit, lbracketbit, rbracketbit;
-    unsigned long str_mask;
-
-     // variables for saving temporary results in the last step
+    // variables for saving temporary results in the last step
     unsigned long lb_mask, rb_mask, cb_mask;
     unsigned long lb_bit, rb_bit, cb_bit;
     unsigned long first, second;
@@ -682,7 +811,7 @@ __device__ void GPULocalBitmap::buildLeveledBitmap() {
                         lb_mask = lb_mask & (lb_mask - 1);
                         lb_bit = lb_mask & (-lb_mask);
                         ++cur_level;
-                        if (mThreadId == 0 && cur_level == 0) {
+                        if (threadIdx.x == 0 && cur_level == 0) {
                             // JSON record at the top level could be an array
                             if (!mLevCommaBitmap[cur_level]) {
                                 mLevCommaBitmap[cur_level] = (unsigned long*)malloc(mNumWords * sizeof(unsigned long));
@@ -708,33 +837,100 @@ __device__ void GPULocalBitmap::buildLeveledBitmap() {
         }
     }
     if (mDepth == MAX_LEVEL - 1) mDepth = mMaxPositiveLevel;
-    mEndLevel = cur_level;
+    endLevels[threadIdx.x] = cur_level;
+
+    // Sync threads to access endLevels on all threads
+    __syncthreads();
+
+    // Merge bitmaps here and save only the final ones. This works because each thread is running individually
+    int curLevel = endLevels[0];
+
+    if (threadIdx.x != 0) {
+    for (int i = 0; i <= mMaxPositiveLevel; ++i) {
+            *finalColonBitmaps[threadIdx.x][i] = mLevColonBitmap[i];
+            *finalCommaBitmaps[threadIdx.x][i] = mLevCommaBitmap[i];
+        }
+    } else {
+        // Set cur_level to the correct value
+        for (int i = 1; i < threadIdx.x; ++i) {
+            curLevel += (endLevels[i] + 1);
+        }
+
+        for(int j = 1; j <= -mMinNegativeLevel && (curLevel - j + 1) >= 0; ++j) {
+            *finalColonBitmaps[threadIdx.x][curLevel - j + 1] = mNegLevColonBitmap[j];
+            *finalCommaBitmaps[threadIdx.x][curLevel - j + 1] = mNegLevCommaBitmap[j];
+        }
+        for(int j = 0; j <= mMaxPositiveLevel && (curLevel + j + 1) >= 0; ++j) {
+            *finalColonBitmaps[threadIdx.x][curLevel + j + 1] = mLevColonBitmap[j];
+            *finalCommaBitmaps[threadIdx.x][curLevel + j + 1] = mLevCommaBitmap[j];
+        }
+    }
+
+
+    // Free all local temp bitmaps that were created
+    for (int m = 0; m < MAX_LEVEL; ++m){
+        if (mLevColonBitmap[m]) {
+            free(mLevColonBitmap[m]);
+            mLevColonBitmap[m] = NULL;
+        }
+        if (mLevCommaBitmap[m]) {
+            free(mLevCommaBitmap[m]);
+            mLevCommaBitmap[m] = NULL;
+        }
+        if (mNegLevColonBitmap[m]) {
+            free(mNegLevColonBitmap[m]);
+            mNegLevColonBitmap[m] = NULL;
+        }
+        if (mNegLevCommaBitmap[m]) {
+            free(mNegLevCommaBitmap[m]);
+            mNegLevCommaBitmap[m] = NULL;
+        }
+    }
+
+    if (mStrBitmap) {
+        free(mStrBitmap);
+        mStrBitmap = NULL;
+    }
+    if (mColonBitmap) {
+        free(mColonBitmap);
+        mColonBitmap = NULL;
+    }
+    if (mCommaBitmap) {
+        free(mCommaBitmap);
+        mCommaBitmap = NULL;
+    }
+    if (mLbraceBitmap) {
+        free(mLbraceBitmap);
+        mLbraceBitmap = NULL;
+    }
+    if (mRbraceBitmap) {
+        free(mRbraceBitmap);
+        mRbraceBitmap = NULL;
+    }
+    if (mLbracketBitmap) {
+        free(mLbracketBitmap);
+        mLbracketBitmap = NULL;
+    }
+    if (mRbracketBitmap) {
+        free(mRbracketBitmap);
+        mRbracketBitmap = NULL;
+    }
+
+    return;
 }
+
+
+__global__ void test(unsigned long* quoteBitmaps, int recordLength) {
+    unsigned long count = 0;
+    for (int i = 0; i < (int)(recordLength /64); ++i) {
+        quoteBitmaps[i] = count;
+        ++count;
+    }
+}
+
+// Host data and functions
 
 GPUParallelBitmap* GPUParallelBitmapConstructor::mGPUParallelBitmap = NULL;
-
-__global__ void nonSpecIndexConstructionKernel(GPUParallelBitmap* mGPUParallelBitmap) {
-
-    mGPUParallelBitmap->mBitmaps[threadIdx.x]->nonSpecIndexConstruction();
-    // cout<<thread_id<<"th thread finishes structural index construction."<<endl;
-    __syncthreads();
-}
-
-__global__ void buildStringMaskBitmapKernel(GPUParallelBitmap* mGPUParallelBitmap) {
-
-    //cout<<thread_id<<"th thread starts building string mask bitmap."<<endl;
-    mGPUParallelBitmap->mBitmaps[threadIdx.x]->buildStringMaskBitmap();
-    //cout<<thread_id<<"th thread finishes building string mask bitmap."<<endl;
-    __syncthreads();
-}
-
-__global__ void buildLeveledBitmapKernel(GPUParallelBitmap* mGPUParallelBitmap) {
-
-    mGPUParallelBitmap->mBitmaps[threadIdx.x]->buildLeveledBitmap();
-    //cout<<thread_id<<"th thread finishes building leveled bitmap."<<endl;
-    __syncthreads();
-
-}
 
 
 GPUParallelBitmap* GPUParallelBitmapConstructor::construct(Record* record, int thread_num, int level_num) {
@@ -749,29 +945,168 @@ GPUParallelBitmap* GPUParallelBitmapConstructor::construct(Record* record, int t
     mGPUParallelBitmap = new GPUParallelBitmap(record_text, length, thread_num, level_num);
     int mode = mGPUParallelBitmap->parallelMode();
 
-    int chunk_len = rec_len / thread_num;
-    if (chunk_len % 64 > 0) {
-        chunk_len = chunk_len + 64 - chunk_len % 64;
-    }
 
-
+    // Settng up CUDA 
     cudaDeviceSetLimit(cudaLimitMallocHeapSize, 64*1024*1024);
+    cudaError_t err = cudaSuccess;
+
+    // 1. Create cuda variables
+    int* dev_chunkEndLocs;
+    char* dev_record;
+    int localDepth = level_num - 1;
+
+    unsigned long* dev_mStartInStrBitmaps;
+    unsigned long* dev_mEndInStrBitmaps;
+
+    int* dev_endLevels;
+
+
+    // Allocate memory for cuda pointers and copy for pointer arrays
+    cudaMalloc((void**)&dev_chunkEndLocs, MAX_THREAD * sizeof(int));
+    cudaMalloc(&dev_record, sizeof(record_text));
+    cudaMalloc((void**)&dev_mStartInStrBitmaps, MAX_THREAD * sizeof(unsigned long));
+    cudaMalloc((void**)&dev_mEndInStrBitmaps, MAX_THREAD * sizeof(unsigned long));
+    cudaMalloc((void**)&dev_endLevels, MAX_THREAD * sizeof(int));
+
+    cudaMemcpy(dev_chunkEndLocs, mGPUParallelBitmap->chunkEndLocs, MAX_THREAD * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_record, record_text, sizeof(record_text), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_mStartInStrBitmaps, mGPUParallelBitmap->mStartInStrBitmaps, MAX_THREAD * sizeof(unsigned long), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_mEndInStrBitmaps, mGPUParallelBitmap->mStartInStrBitmaps, MAX_THREAD * sizeof(unsigned long), cudaMemcpyHostToDevice);\
+    cudaMemcpy(dev_endLevels, mGPUParallelBitmap->endLevels, MAX_THREAD * sizeof(int), cudaMemcpyHostToDevice);
+
+
+    int size = MAX_THREAD * MAX_LEVEL * 1;
+    int quoteSize = int(length / 64);
+    unsigned long* d_finalColonBitmaps;
+    unsigned long* d_finalCommaBitmaps;
+    unsigned long* d_quoteBitmaps;
+    cudaMalloc((void**)&d_finalColonBitmaps, size * sizeof(unsigned long));
+    cudaMalloc((void**)&d_finalCommaBitmaps, size * sizeof(unsigned long));
+    cudaMalloc((void**)&d_quoteBitmaps, quoteSize * sizeof(unsigned long));
+
+
+    unsigned long* h_flattenedColonBitmaps = new unsigned long[size];
+    unsigned long* h_flattenedCommaBitmaps = new unsigned long[size];
+    unsigned long* h_flattenedQuoteBitmaps = new unsigned long[quoteSize];
+    
+    cout << "Memory allocated successfully for leveled bitmaps" << endl;
+
+    cudaMemcpy(d_finalColonBitmaps, h_flattenedColonBitmaps, size * sizeof(unsigned long), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_finalCommaBitmaps, h_flattenedCommaBitmaps, size * sizeof(unsigned long), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_quoteBitmaps, h_flattenedQuoteBitmaps, quoteSize * sizeof(unsigned long), cudaMemcpyHostToDevice);
+
+    cout << "Memory copied for leveled bitmaps" << endl;
+
+
+   
 
     if (mode == NONSPECULATIVE) {
+        cout << "nonspec" << endl;
+        // 3. Call Kernel function with parallel threads
+        nonSpecIndexConstructionKernel<<<1, thread_num>>>(
+            dev_chunkEndLocs, 
+            dev_record, 
+            localDepth, 
+            d_finalColonBitmaps, 
+            d_finalCommaBitmaps, 
+            d_quoteBitmaps,
+            dev_mStartInStrBitmaps,
+            dev_endLevels
+            );
 
-        // TODO: Create correct cuda variables
+        // test<<<1, thread_num>>>(d_quoteBitmaps, mGPUParallelBitmap->chunkEndLocs[127]);
+        cudaDeviceSynchronize();
 
+        // Do this later
+        //mGPUParallelBitmap->setWordIds(thread_num);
 
-
-
-        nonSpecIndexConstructionKernel<<<1, thread_num>>>(mGPUParallelBitmap);
-        mGPUParallelBitmap->mergeBitmaps();
     } else {
-        buildStringMaskBitmapKernel<<<1, thread_num>>>(mGPUParallelBitmap);
-        mGPUParallelBitmap->rectifyStringMaskBitmaps();
-        buildLeveledBitmapKernel<<<1, thread_num>>>(mGPUParallelBitmap);
-        mGPUParallelBitmap->mergeBitmaps();
+        // TODO: fix spec function as well
+
+        // specIndexConstructionKernel<<<1, thread_num>>>(
+        //         dev_chunkEndLocs, 
+        //         dev_record, 
+        //         localDepth, 
+        //         d_finalColonBitmaps, 
+        //         d_finalCommaBitmaps, 
+        //         d_quoteBitmaps,
+        //         dev_mStartInStrBitmaps,
+        //         dev_mEndInStrBitmaps,
+        //         dev_endLevels
+        //         );
+
+        // TODO: Figure out where to put this
+        //mGPUParallelBitmap->setWordIds(thread_num);
     }
-    cout << "Depth at end of constructor: " << mGPUParallelBitmap->mDepth << endl;
+
+    cout << "Finishes thread calls" << endl;
+
+    cudaMemcpy(h_flattenedColonBitmaps, d_finalColonBitmaps, size * sizeof(unsigned long), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_flattenedCommaBitmaps, d_finalCommaBitmaps, size * sizeof(unsigned long), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_flattenedQuoteBitmaps, d_quoteBitmaps, quoteSize * sizeof(unsigned long), cudaMemcpyDeviceToHost);
+
+    cout << "Finished memory copying back to host variables" << endl;
+
+    // TODO: Correctly reassign memory for quoteBitmaps
+    // This step is different for quote bitmaps because size varies depending on the pad length (values stored in chunkEndLocs)
+
+    int index = 0;
+    for (int i = 0; i < MAX_THREAD; ++i) {
+        for (int j = 0; j < MAX_LEVEL; ++j) {
+            for (int k = 0; k < 1; ++k) {
+                mGPUParallelBitmap->finalColonBitmaps[i][j][k] = h_flattenedColonBitmaps[index];
+                mGPUParallelBitmap->finalCommaBitmaps[i][j][k] = h_flattenedCommaBitmaps[index];
+                ++index;
+            }
+        }
+    }
+
+    index = 0;
+    for (int i = 0; i < MAX_THREAD; ++i) {
+        int maxNum = 0;
+        if (i == 0) {
+            maxNum = mGPUParallelBitmap->chunkEndLocs[0];
+        } else {
+            maxNum = mGPUParallelBitmap->chunkEndLocs[i] - mGPUParallelBitmap->chunkEndLocs[i-1];
+        }
+        cout << "MaxNum: " << maxNum << endl;
+
+        for (int j = 0; j < (int)(maxNum/64); ++j) {
+            mGPUParallelBitmap->quoteBitmaps[i][j] = h_flattenedQuoteBitmaps[index];
+            //cout << "Value at i: " << i << ", j: " << j << " is: " << mGPUParallelBitmap->quoteBitmaps[i][j] << endl;
+            ++index;
+        }
+    }
+
+    cout << "Memory copied to parallelBitmap vars" << endl;
+
+    cout << "Test: " << mGPUParallelBitmap->finalCommaBitmaps[0][0][0] << endl;
+
+
+    for (int p = 0; p < 128; ++p) {
+        for (int i = 0; i < MAX_LEVEL; ++i) {
+            if (mGPUParallelBitmap->finalCommaBitmaps[p][i][0] != 0) {
+                cout << "Test: " << mGPUParallelBitmap->finalColonBitmaps[p][i][0] << endl;
+            }
+        }
+    }
+
+    cout << "Finishes" << endl;
+    
+
+    //exit(EXIT_FAILURE);
+
+
+    // 5. Clean up memory
+    // TODO: Correctly clean up memory
+    cudaFree(dev_chunkEndLocs);
+    cudaFree(dev_record);
+    cudaFree(dev_mStartInStrBitmaps);
+    cudaFree(dev_mEndInStrBitmaps);
+    cudaFree(dev_endLevels);
+
+
+    //exit(EXIT_FAILURE);
+
     return mGPUParallelBitmap;
 }
